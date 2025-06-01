@@ -3,123 +3,182 @@
 cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
 ./save_push.sh
 */
-
 #include <HardwareSerial.h>
+#include <RadioLib.h>
 
-#define RX_GNSS 9  // GNSS TX → MCU RX
-#define TX_GNSS 8  // GNSS RX → MCU TX
+#define RX_GNSS 9
+#define TX_GNSS 8
+
+#define CUSTOM_MOSI 12
+#define CUSTOM_MISO 13
+#define CUSTOM_SCLK 11
+#define CUSTOM_NSS  10
+#define CUSTOM_DIO1 2
+#define CUSTOM_NRST 4
+#define CUSTOM_BUSY 3
 
 HardwareSerial GNSS(2);
+SPIClass customSPI(HSPI);
+SX1280 radio = new Module(CUSTOM_NSS, CUSTOM_DIO1, CUSTOM_NRST, CUSTOM_BUSY, customSPI);
 
-unsigned long lastCheckTime = 0;
-bool surveyInStarted = false;
+volatile bool transmittedFlag = false;
+ICACHE_RAM_ATTR void setFlag() { transmittedFlag = true; }
+
+const size_t MAX_LORA_PAYLOAD = 240;
+const size_t HEADER_SIZE = 4;
+uint8_t txBuffer[MAX_LORA_PAYLOAD];
+
+uint8_t rtcmBuffer[1024];
+size_t rtcmBufferIndex = 0;
+unsigned long lastByteTime = 0;
+const unsigned long GAP_TIMEOUT_MS = 200;
+
 bool surveyComplete = false;
 String gnssLine = "";
 
-bool parsingRtcm = false;
-int rtcmLength = 0;
-int rtcmIndex = 0;
-uint8_t rtcmBuffer[1024];
+void sendCommandWithChecksum(const String &cmdBody) {
+  byte checksum = 0;
+  for (int i = 0; i < cmdBody.length(); i++) checksum ^= cmdBody[i];
+  char command[128];
+  snprintf(command, sizeof(command), "$%s*%02X\r\n", cmdBody.c_str(), checksum);
+  GNSS.print(command);
+  Serial.print("Sent: ");
+  Serial.print(command);
+}
+
+void transmitRtcmChunked(uint8_t* data, size_t length) {
+  if (length < 6) return;
+
+  Serial.printf("[RTCM] Sending %zu bytes:\n[Hex] ", length);
+  for (size_t i = 0; i < length; i++) {
+    Serial.printf("%02X ", data[i]);
+    if ((i + 1) % 32 == 0) Serial.println();
+  }
+  Serial.println();
+
+  uint16_t msgID = ((data[3] << 4) | (data[4] >> 4)) & 0x0FFF;
+  uint8_t totalChunks = ceil((float)length / (MAX_LORA_PAYLOAD - HEADER_SIZE));
+
+  for (uint8_t seq = 0; seq < totalChunks; seq++) {
+    size_t offset = seq * (MAX_LORA_PAYLOAD - HEADER_SIZE);
+    size_t chunkSize = min((MAX_LORA_PAYLOAD - HEADER_SIZE), length - offset);
+
+    txBuffer[0] = (msgID >> 8) & 0xFF;
+    txBuffer[1] = msgID & 0xFF;
+    txBuffer[2] = seq;
+    txBuffer[3] = totalChunks;
+
+    memcpy(txBuffer + HEADER_SIZE, data + offset, chunkSize);
+
+    int state = radio.startTransmit(txBuffer, chunkSize + HEADER_SIZE);
+    if (state == RADIOLIB_ERR_NONE) {
+      while (!transmittedFlag);
+      transmittedFlag = false;
+      radio.finishTransmit();
+      Serial.printf("[LoRa] ✅ Chunk %d/%d sent\n", seq + 1, totalChunks);
+    } else {
+      Serial.printf("[LoRa] ❌ Chunk %d send failed: %d\n", seq, state);
+      break;
+    }
+
+    delay(10);
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   GNSS.begin(115200, SERIAL_8N1, RX_GNSS, TX_GNSS);
-  delay(3000);
+  delay(2000);
 
-  // RTCM 출력 비활성화
-  sendCommandWithChecksum("PAIR432,-1");
-  delay(300);
-  sendCommandWithChecksum("PAIR434,0");
-  delay(300);
+  customSPI.begin(CUSTOM_SCLK, CUSTOM_MISO, CUSTOM_MOSI, CUSTOM_NSS);
+  if (radio.begin() != RADIOLIB_ERR_NONE) {
+    Serial.println("[SX1280] Init fail");
+    while (true);
+  }
 
-  // Base 모드 설정
-  sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2");
-  delay(300);
+  radio.setOutputPower(13);
+  radio.setFrequency(2400.0);
+  radio.setBandwidth(812.5);
+  radio.setSpreadingFactor(7);
+  radio.setPacketSentAction(setFlag);
 
-  // Survey-In 시작
-  sendCommandWithChecksum("PQTMCFGSVIN,W,1,100,2.0,0,0,0");
-  delay(300);
+  Serial.println("[Setup] LoRa Ready");
 
-  // 상태 메시지 출력 5초마다
-  sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,5,1");
-  delay(300);
-
-  sendCommandWithChecksum("PQTMSAVEPAR");
-  delay(300);
-
+  // Base + Survey-In 설정
+  sendCommandWithChecksum("PAIR432,-1"); delay(300); //-1끄기 0켜기
+  sendCommandWithChecksum("PAIR434,0"); delay(300); //0끄기 1켜기
+  sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2"); delay(300);
+  sendCommandWithChecksum("PQTMCFGSVIN,W,1,100,2.0,0,0,0"); delay(300);
+  sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,2,1"); delay(300);
+  sendCommandWithChecksum("PQTMSAVEPAR"); delay(300);
 }
 
 void loop() {
+  static uint8_t buffer[512];
+  static size_t index = 0;
+  static bool inPacket = false;
+  static uint16_t expectedLength = 0;
+
+  unsigned long now = millis();
+
   while (GNSS.available()) {
     uint8_t c = GNSS.read();
+    lastByteTime = now;
 
-    // RTCM 메시지 시작 감지
-    if (!parsingRtcm && c == 0xD3) {
-      parsingRtcm = true;
-      rtcmIndex = 0;
-      rtcmBuffer[rtcmIndex++] = c;
-    }
-    else if (parsingRtcm) {
-      rtcmBuffer[rtcmIndex++] = c;
-
-      if (rtcmIndex == 3) {
-        // RTCM 길이는 바이트 2,3의 하위 10비트
-        rtcmLength = ((rtcmBuffer[1] & 0x03) << 8) | rtcmBuffer[2];
-        rtcmLength += 6; // 헤더(3) + CRC(3)
-      }
-
-      if (rtcmIndex >= rtcmLength && rtcmLength > 0) {
-        // RTCM 메시지 완성 → HEX 출력
-        for (int i = 0; i < rtcmIndex; i++) {
-          if (rtcmBuffer[i] < 0x10) Serial.print("0");
-          Serial.print(rtcmBuffer[i], HEX);
-          Serial.print(" ");
-        }
-        Serial.println();
-        parsingRtcm = false;
-        rtcmLength = 0;
-        rtcmIndex = 0;
-      }
-    }
-    else {
-      // 일반 ASCII 메시지는 그대로 출력
-      Serial.write(c);
-
-      if (c == '\n') {
-        // Survey-In 완료 체크
-        if (!surveyComplete && gnssLine.startsWith("$PQTMSVINSTATUS") && gnssLine.indexOf(",2,") > 0) {
-          surveyComplete = true;
-          Serial.println("✅ Survey-In 완료!");
-
-          sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,0,1");
-          delay(300);
-          sendCommandWithChecksum("PAIR432,1"); // RTCM 켜기
-          delay(300);
-          sendCommandWithChecksum("PAIR434,1"); // 1005 포함
-          delay(300);
-          sendCommandWithChecksum("PQTMSAVEPAR");
-          delay(300);
-        }
-        gnssLine = "";
+    if (!inPacket) {
+      if (c == 0xD3) {
+        buffer[0] = c;
+        index = 1;
+        inPacket = true;
       } else {
-        gnssLine += (char)c;
+        Serial.write(c);
+        if (c == '\n') {
+          if (!surveyComplete && gnssLine.startsWith("$PQTMSVINSTATUS") && gnssLine.indexOf(",2,") > 0) {
+            surveyComplete = true;
+            Serial.println("✅ Survey-In 완료!");
+            sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,0,1"); delay(300);
+            sendCommandWithChecksum("PAIR432,1"); delay(300);
+            sendCommandWithChecksum("PAIR434,1"); delay(300);
+            sendCommandWithChecksum("PQTMSAVEPAR"); delay(300);
+          }
+          gnssLine = "";
+        } else {
+          gnssLine += (char)c;
+        }
+      }
+    } else {
+      buffer[index++] = c;
+
+      if (index == 3) {
+        expectedLength = ((buffer[1] & 0x03) << 8) | buffer[2];
+        if (expectedLength > 480) {
+          Serial.println("[RTCM] Invalid length, dropping");
+          inPacket = false;
+          index = 0;
+          continue;
+        }
+      }
+
+      if (index == expectedLength + 6) {
+        if (surveyComplete && rtcmBufferIndex + index < sizeof(rtcmBuffer)) {
+          memcpy(rtcmBuffer + rtcmBufferIndex, buffer, index);
+          rtcmBufferIndex += index;
+        }
+        inPacket = false;
+        index = 0;
+        expectedLength = 0;
+      }
+
+      if (index >= sizeof(buffer)) {
+        Serial.println("[RTCM] Temp buffer overflow");
+        inPacket = false;
+        index = 0;
       }
     }
   }
 
-
-}
-
-void sendCommandWithChecksum(const String &cmdBody) {
-  byte checksum = 0;
-  for (int i = 0; i < cmdBody.length(); i++) {
-    checksum ^= cmdBody[i];
+  if (surveyComplete && rtcmBufferIndex > 0 && now - lastByteTime > GAP_TIMEOUT_MS) {
+    transmitRtcmChunked(rtcmBuffer, rtcmBufferIndex);
+    rtcmBufferIndex = 0;
   }
-
-  char command[128];
-  snprintf(command, sizeof(command), "$%s*%02X\r\n", cmdBody.c_str(), checksum);
-
-  GNSS.print(command);
-  Serial.print("Sent: ");
-  Serial.print(command);
 }
