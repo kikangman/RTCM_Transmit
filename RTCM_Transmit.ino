@@ -1,136 +1,165 @@
-#include <TinyGPS++.h>
+//git kikangman
+
 #include <RadioLib.h>
 #include <HardwareSerial.h>
 
-// Define custom SPI pins
 #define CUSTOM_MOSI 12
 #define CUSTOM_MISO 13
 #define CUSTOM_SCLK 11
-#define CUSTOM_NSS 10
+#define CUSTOM_NSS  10
 #define CUSTOM_DIO1 2
 #define CUSTOM_NRST 4
 #define CUSTOM_BUSY 3
 
-// Define custom UART pins
-#define RX_PIN 9   // RX (GPS)
-#define TX_PIN 10  // TX (GPS)
+#define RX_GNSS 9
+#define TX_GNSS 8
 
-
-// Create a custom SPI instance
-SPIClass customSPI(HSPI);  // Use HSPI or VSPI depending on your setup
-
-// Create an SX1280 instance with custom SPI
+SPIClass customSPI(HSPI);
 SX1280 radio = new Module(CUSTOM_NSS, CUSTOM_DIO1, CUSTOM_NRST, CUSTOM_BUSY, customSPI);
+HardwareSerial GNSS(1);
 
-// UART settings
-HardwareSerial mySerial(2);  // UART2 for GPS
+// --- 전역 변수 및 상태 ---
+unsigned long lastStatusQuery = 0;
+unsigned long lastByteTime = 0;
+bool surveyInComplete = false;
 
-// TinyGPS++ object
-TinyGPSPlus gps;
+const unsigned long GAP_TIMEOUT_MS = 50;
+
+uint8_t rtcmBuffer[1024];
+size_t rtcmBufferIndex = 0;
 
 volatile bool transmittedFlag = false;
+ICACHE_RAM_ATTR void setFlag() { transmittedFlag = true; }
 
-unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 1000;  // 1초
+void transmitRtcmChunked(uint8_t* data, size_t length) {
+  if (length < 6) return;
 
+  uint16_t msgID = ((data[3] << 4) | (data[4] >> 4)) & 0x0FFF;
+  uint8_t totalChunks = ceil((float)length / (240 - 4));
+  uint8_t txBuffer[240];
 
+  for (uint8_t seq = 0; seq < totalChunks; seq++) {
+    size_t offset = seq * (240 - 4);
+    size_t chunkSize = min((size_t)236, length - offset);
 
-// This function is called when a complete packet is transmitted
-#if defined(ESP8266) || defined(ESP32)
-ICACHE_RAM_ATTR
-#endif
-void setFlag(void) {
-  transmittedFlag = true;
+    txBuffer[0] = (msgID >> 8) & 0xFF;
+    txBuffer[1] = msgID & 0xFF;
+    txBuffer[2] = seq;
+    txBuffer[3] = totalChunks;
+
+    memcpy(txBuffer + 4, data + offset, chunkSize);
+
+    int state = radio.startTransmit(txBuffer, chunkSize + 4);
+    if (state == RADIOLIB_ERR_NONE) {
+      while (!transmittedFlag);
+      transmittedFlag = false;
+      radio.finishTransmit();
+      Serial.printf("[LoRa] ✅ Chunk %d/%d sent\n", seq + 1, totalChunks);
+    } else {
+      Serial.printf("[LoRa] ❌ Chunk %d send failed: %d\n", seq, state);
+      break;
+    }
+    delay(10);
+  }
 }
 
 void setup() {
-  // UART initialization
-  mySerial.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);  // Baud rate 115200, RX/TX pins
-  Serial.begin(115200);                                // For debugging
+  Serial.begin(115200);
+  GNSS.begin(115200, SERIAL_8N1, RX_GNSS, TX_GNSS);
+  delay(1000);
+  Serial.println("[Setup] Starting...");
 
-  Serial.println(F("[Setup] Initializing LoRa and UART..."));
-
-  // Initialize custom SPI
   customSPI.begin(CUSTOM_SCLK, CUSTOM_MISO, CUSTOM_MOSI, CUSTOM_NSS);
-
-  // Initialize SX1280 with default settings
-  Serial.print(F("[SX1280] Initializing ... "));
-  int state = radio.begin();
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println(F("success!"));
-  } else {
-    Serial.print(F("failed, code "));
-    Serial.println(state);
-    while (true) { delay(10); }
+  if (radio.begin() != RADIOLIB_ERR_NONE) {
+    Serial.println("[SX1280] Init failed");
+    while (true);
   }
 
-  // Set the function that will be called when packet transmission is finished
+  radio.setOutputPower(13);
+  radio.setFrequency(2400.0);
+  radio.setBandwidth(812.5);
+  radio.setSpreadingFactor(7);
   radio.setPacketSentAction(setFlag);
+  Serial.println("[Setup] LoRa Ready");
 
-  Serial.println(F("[Setup] Initialization complete."));
+  GNSS.print("$PQTMCFGRCVRMODE,W,2*29\r\n");
+  GNSS.print("$PQTMCFGSVIN,W,1,180,2.5,0,0,0*2D\r\n");
+  GNSS.print("$PAIR432,1*3B\r\n");
+  GNSS.print("$PQTMSAVEPAR*5A\r\n");
+  Serial.println("[Setup] GNSS Base & Survey-In 설정 완료");
 }
 
 void loop() {
-  // Parse GPS data
-  while (mySerial.available() > 0) {
-    gps.encode(mySerial.read());
+  unsigned long now = millis();
+
+  if (now - lastStatusQuery > 10000) {
+    GNSS.print("$PQTMSVINSTATUS,1*3A\r\n");
+    lastStatusQuery = now;
+    Serial.println("[DEBUG] Requesting survey-in status");
   }
 
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastSendTime >= sendInterval) {
-    lastSendTime = currentMillis;
-    sendParsedGPSData();  // 주기적으로 GPS 데이터 전송
+  // --- NMEA 수신 라인 우선 처리 ---
+  while (GNSS.available()) {
+    String line = GNSS.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("$PQTMSVINSTATUS")) {
+      Serial.println("[Survey-In] " + line);
+      int statusIdx = line.indexOf(',', 3);
+      if (statusIdx != -1) {
+        int status = line.charAt(statusIdx + 1) - '0';
+        if (status == 2 && !surveyInComplete) {
+          surveyInComplete = true;
+          Serial.println("[Survey-In] ✅ 완료됨! 기준국 위치가 반영됨");
+          GNSS.print("$PQTMSAVEPAR*5A\r\n");
+        }
+      }
+    }
   }
 
-  // 전송 완료 처리
-  if (transmittedFlag) {
-    transmittedFlag = false;
-    Serial.println(F("[SX1280] Transmission finished!"));
-    radio.finishTransmit();
+  // RTCM 수신 처리
+  static uint8_t buffer[512];
+  static size_t index = 0;
+  static bool inPacket = false;
+  static uint16_t expectedLength = 0;
+
+  while (GNSS.available()) {
+    uint8_t byteIn = GNSS.read();
+    lastByteTime = now;
+
+    if (!inPacket) {
+      if (byteIn == 0xD3) {
+        buffer[0] = byteIn;
+        index = 1;
+        inPacket = true;
+      }
+    } else {
+      buffer[index++] = byteIn;
+
+      if (index == 3) {
+        expectedLength = ((buffer[1] & 0x03) << 8) | buffer[2];
+      }
+
+      if (index == expectedLength + 6) {
+        if (rtcmBufferIndex + index < sizeof(rtcmBuffer)) {
+          memcpy(rtcmBuffer + rtcmBufferIndex, buffer, index);
+          rtcmBufferIndex += index;
+        }
+        inPacket = false;
+        index = 0;
+        expectedLength = 0;
+      }
+
+      if (index >= sizeof(buffer)) {
+        Serial.println("[RTCM] Temp buffer overflow");
+        inPacket = false;
+        index = 0;
+      }
+    }
   }
-  
-}
 
-void sendParsedGPSData() {
-  String gpsData = "";
-
-  // Latitude and Longitude
-  if (gps.location.isValid()) {
-    gpsData += String(gps.location.lat(), 6) + ",";
-    gpsData += String(gps.location.lng(), 6) + ",";
-  } else {
-    gpsData += "INVALID,INVALID,";
-  }
-
-  // Time
-  if (gps.time.isValid()) {
-    if (gps.time.hour() < 10) gpsData += "0";
-    gpsData += String(gps.time.hour()) + ":";
-    if (gps.time.minute() < 10) gpsData += "0";
-    gpsData += String(gps.time.minute()) + ":";
-    if (gps.time.second() < 10) gpsData += "0";
-    gpsData += String(gps.time.second()) + ",";
-  } else {
-    gpsData += "INVALID,";
-  }
-
-  // Satellite count
-  if (gps.satellites.isValid()) {
-    gpsData += String(gps.satellites.value());
-  }
-
-  // Log data to Serial for debugging
-  Serial.println(F("[GPS] Parsed data: "));
-  Serial.println(gpsData);
-
-  // Transmit GPS data over LoRa
-  Serial.print(F("[SX1280] Sending GPS data over LoRa: "));
-  Serial.println(gpsData);
-  int state = radio.startTransmit(gpsData);
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println(F("[SX1280] Transmission started successfully."));
-  } else {
-    Serial.print(F("[SX1280] Transmission failed, code "));
-    Serial.println(state);
+  if (surveyInComplete && rtcmBufferIndex > 0 && now - lastByteTime > GAP_TIMEOUT_MS) {
+    Serial.printf("[RTCM] Sending %d bytes...\n", rtcmBufferIndex);
+    transmitRtcmChunked(rtcmBuffer, rtcmBufferIndex);
+    rtcmBufferIndex = 0;
   }
 }
