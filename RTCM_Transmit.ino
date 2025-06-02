@@ -1,8 +1,11 @@
+
 //git kikangman
 /*
 cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
 ./save_push.sh "??"
 */
+
+// Base 코드 (위치 수신 안정화 적용 버전)
 #include <HardwareSerial.h>
 #include <RadioLib.h>
 
@@ -12,7 +15,7 @@ cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
 #define CUSTOM_MOSI 12
 #define CUSTOM_MISO 13
 #define CUSTOM_SCLK 11
-#define CUSTOM_NSS  10
+#define CUSTOM_NSS 10
 #define CUSTOM_DIO1 2
 #define CUSTOM_NRST 4
 #define CUSTOM_BUSY 3
@@ -22,7 +25,15 @@ SPIClass customSPI(HSPI);
 SX1280 radio = new Module(CUSTOM_NSS, CUSTOM_DIO1, CUSTOM_NRST, CUSTOM_BUSY, customSPI);
 
 volatile bool transmittedFlag = false;
-ICACHE_RAM_ATTR void setFlag() { transmittedFlag = true; }
+volatile bool coordReceived = false;
+
+ICACHE_RAM_ATTR void setTransmitFlag() {
+  transmittedFlag = true;
+}
+
+ICACHE_RAM_ATTR void setCoordReceivedFlag() {
+  coordReceived = true;
+}
 
 const size_t MAX_LORA_PAYLOAD = 240;
 const size_t HEADER_SIZE = 4;
@@ -36,7 +47,7 @@ const unsigned long GAP_TIMEOUT_MS = 200;
 bool surveyComplete = false;
 String gnssLine = "";
 
-void sendCommandWithChecksum(const String &cmdBody) {
+void sendCommandWithChecksum(const String& cmdBody) {
   byte checksum = 0;
   for (int i = 0; i < cmdBody.length(); i++) checksum ^= cmdBody[i];
   char command[128];
@@ -48,13 +59,12 @@ void sendCommandWithChecksum(const String &cmdBody) {
 
 void transmitRtcmChunked(uint8_t* data, size_t length) {
   if (length < 6) return;
+  Serial.printf("\n[RTCM] Sending %zu bytes:\n", length);
 
-  Serial.printf("[RTCM] Sending %zu bytes:\n[Hex] ", length);
-  for (size_t i = 0; i < length; i++) {
-    Serial.printf("%02X ", data[i]);
-    if ((i + 1) % 32 == 0) Serial.println();
-  }
-  Serial.println();
+  radio.setPacketReceivedAction(NULL);
+  radio.setPacketSentAction(setTransmitFlag);
+  radio.standby();
+  delay(2);
 
   uint16_t msgID = ((data[3] << 4) | (data[4] >> 4)) & 0x0FFF;
   uint8_t totalChunks = ceil((float)length / (MAX_LORA_PAYLOAD - HEADER_SIZE));
@@ -67,12 +77,14 @@ void transmitRtcmChunked(uint8_t* data, size_t length) {
     txBuffer[1] = msgID & 0xFF;
     txBuffer[2] = seq;
     txBuffer[3] = totalChunks;
+    if (seq == totalChunks - 1) txBuffer[3] |= 0x80; // 마지막 청크 표시
 
     memcpy(txBuffer + HEADER_SIZE, data + offset, chunkSize);
 
     int state = radio.startTransmit(txBuffer, chunkSize + HEADER_SIZE);
     if (state == RADIOLIB_ERR_NONE) {
-      while (!transmittedFlag);
+      unsigned long waitStart = millis();
+      while (!transmittedFlag && millis() - waitStart < 500);
       transmittedFlag = false;
       radio.finishTransmit();
       Serial.printf("[LoRa] ✅ Chunk %d/%d sent\n", seq + 1, totalChunks);
@@ -80,9 +92,12 @@ void transmitRtcmChunked(uint8_t* data, size_t length) {
       Serial.printf("[LoRa] ❌ Chunk %d send failed: %d\n", seq, state);
       break;
     }
-
     delay(10);
   }
+
+  radio.startReceive();
+  radio.setPacketReceivedAction(setCoordReceivedFlag);
+  Serial.println("[Base] 수신 대기 시작");
 }
 
 void setup() {
@@ -95,18 +110,18 @@ void setup() {
     Serial.println("[SX1280] Init fail");
     while (true);
   }
-
+  radio.standby();
   radio.setOutputPower(13);
   radio.setFrequency(2400.0);
   radio.setBandwidth(812.5);
   radio.setSpreadingFactor(7);
-  radio.setPacketSentAction(setFlag);
+  radio.setPacketSentAction(setTransmitFlag);
+  radio.setPacketReceivedAction(setCoordReceivedFlag);
+  radio.startReceive();
 
   Serial.println("[Setup] LoRa Ready");
-
-  // Base + Survey-In 설정
-  sendCommandWithChecksum("PAIR432,-1"); delay(300); //-1끄기 0켜기
-  sendCommandWithChecksum("PAIR434,0"); delay(300); //0끄기 1켜기
+  sendCommandWithChecksum("PAIR432,-1"); delay(300);
+  sendCommandWithChecksum("PAIR434,0"); delay(300);
   sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2"); delay(300);
   sendCommandWithChecksum("PQTMCFGSVIN,W,1,300,2.0,0,0,0"); delay(300);
   sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,2,1"); delay(300);
@@ -131,7 +146,6 @@ void loop() {
         index = 1;
         inPacket = true;
       } else {
-        Serial.write(c);
         if (c == '\n') {
           if (!surveyComplete && gnssLine.startsWith("$PQTMSVINSTATUS") && gnssLine.indexOf(",2,") > 0) {
             surveyComplete = true;
@@ -151,8 +165,8 @@ void loop() {
 
       if (index == 3) {
         expectedLength = ((buffer[1] & 0x03) << 8) | buffer[2];
-        if (expectedLength > 480) {
-          Serial.println("[RTCM] Invalid length, dropping");
+        if (expectedLength == 0 || expectedLength > 480) {
+          Serial.println("[RTCM] Invalid or zero length");
           inPacket = false;
           index = 0;
           continue;
@@ -180,5 +194,22 @@ void loop() {
   if (surveyComplete && rtcmBufferIndex > 0 && now - lastByteTime > GAP_TIMEOUT_MS) {
     transmitRtcmChunked(rtcmBuffer, rtcmBufferIndex);
     rtcmBufferIndex = 0;
+  }
+
+  if (surveyComplete && coordReceived) {
+    coordReceived = false;
+    uint8_t locBuffer[64] = {0};
+    int len = radio.readData(locBuffer, sizeof(locBuffer));
+    if (len == RADIOLIB_ERR_NONE) {
+      String msg = (char*)locBuffer;
+      if (msg.indexOf(',') > 0) {
+        float lat = msg.substring(0, msg.indexOf(',')).toFloat();
+        float lon = msg.substring(msg.indexOf(',') + 1).toFloat();
+        Serial.printf("[Rover 좌표 수신] %.8f, %.8f\n", lat, lon);
+      }
+    } else {
+      Serial.printf("[LoRa] ❌ 좌표 수신 실패 (code %d)\n", len);
+    }
+    radio.startReceive();
   }
 }
