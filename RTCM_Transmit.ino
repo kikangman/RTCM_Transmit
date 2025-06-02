@@ -1,7 +1,7 @@
 //git kikangman
 /*
 cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
-./save_push.sh
+./save_push.sh "??"
 */
 #include <HardwareSerial.h>
 #include <RadioLib.h>
@@ -108,7 +108,7 @@ void setup() {
   sendCommandWithChecksum("PAIR432,-1"); delay(300); //-1끄기 0켜기
   sendCommandWithChecksum("PAIR434,0"); delay(300); //0끄기 1켜기
   sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2"); delay(300);
-  sendCommandWithChecksum("PQTMCFGSVIN,W,1,100,2.0,0,0,0"); delay(300);
+  sendCommandWithChecksum("PQTMCFGSVIN,W,1,300,2.0,0,0,0"); delay(300);
   sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,2,1"); delay(300);
   sendCommandWithChecksum("PQTMSAVEPAR"); delay(300);
 }
