@@ -3,9 +3,9 @@
 /*
 cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
 ./save_push.sh "??"
+
 */
 
-// Base 코드 (위치 수신 안정화 적용 버전)
 #include <HardwareSerial.h>
 #include <RadioLib.h>
 
@@ -77,14 +77,15 @@ void transmitRtcmChunked(uint8_t* data, size_t length) {
     txBuffer[1] = msgID & 0xFF;
     txBuffer[2] = seq;
     txBuffer[3] = totalChunks;
-    if (seq == totalChunks - 1) txBuffer[3] |= 0x80; // 마지막 청크 표시
+    if (seq == totalChunks - 1) txBuffer[3] |= 0x80;  // 마지막 청크 플래그
 
     memcpy(txBuffer + HEADER_SIZE, data + offset, chunkSize);
 
     int state = radio.startTransmit(txBuffer, chunkSize + HEADER_SIZE);
     if (state == RADIOLIB_ERR_NONE) {
       unsigned long waitStart = millis();
-      while (!transmittedFlag && millis() - waitStart < 500);
+      while (!transmittedFlag && millis() - waitStart < 500)
+        ;
       transmittedFlag = false;
       radio.finishTransmit();
       Serial.printf("[LoRa] ✅ Chunk %d/%d sent\n", seq + 1, totalChunks);
@@ -108,8 +109,10 @@ void setup() {
   customSPI.begin(CUSTOM_SCLK, CUSTOM_MISO, CUSTOM_MOSI, CUSTOM_NSS);
   if (radio.begin() != RADIOLIB_ERR_NONE) {
     Serial.println("[SX1280] Init fail");
-    while (true);
+    while (true)
+      ;
   }
+
   radio.standby();
   radio.setOutputPower(13);
   radio.setFrequency(2400.0);
@@ -120,12 +123,19 @@ void setup() {
   radio.startReceive();
 
   Serial.println("[Setup] LoRa Ready");
-  sendCommandWithChecksum("PAIR432,-1"); delay(300);
-  sendCommandWithChecksum("PAIR434,0"); delay(300);
-  sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2"); delay(300);
-  sendCommandWithChecksum("PQTMCFGSVIN,W,1,300,2.0,0,0,0"); delay(300);
-  sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,2,1"); delay(300);
-  sendCommandWithChecksum("PQTMSAVEPAR"); delay(300);
+
+  sendCommandWithChecksum("PAIR432,-1");
+  delay(300);
+  sendCommandWithChecksum("PAIR434,0");
+  delay(300);
+  sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2");
+  delay(300);
+  sendCommandWithChecksum("PQTMCFGSVIN,W,1,300,2.0,0,0,0");
+  delay(300);
+  sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,2,1");
+  delay(300);
+  sendCommandWithChecksum("PQTMSAVEPAR");
+  delay(300);
 }
 
 void loop() {
@@ -136,6 +146,7 @@ void loop() {
 
   unsigned long now = millis();
 
+  // RTCM 수신 처리
   while (GNSS.available()) {
     uint8_t c = GNSS.read();
     lastByteTime = now;
@@ -150,10 +161,14 @@ void loop() {
           if (!surveyComplete && gnssLine.startsWith("$PQTMSVINSTATUS") && gnssLine.indexOf(",2,") > 0) {
             surveyComplete = true;
             Serial.println("✅ Survey-In 완료!");
-            sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,0,1"); delay(300);
-            sendCommandWithChecksum("PAIR432,1"); delay(300);
-            sendCommandWithChecksum("PAIR434,1"); delay(300);
-            sendCommandWithChecksum("PQTMSAVEPAR"); delay(300);
+            sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,0,1");
+            delay(300);
+            sendCommandWithChecksum("PAIR432,1");
+            delay(300);
+            sendCommandWithChecksum("PAIR434,1");
+            delay(300);
+            sendCommandWithChecksum("PQTMSAVEPAR");
+            delay(300);
           }
           gnssLine = "";
         } else {
@@ -162,11 +177,10 @@ void loop() {
       }
     } else {
       buffer[index++] = c;
-
       if (index == 3) {
         expectedLength = ((buffer[1] & 0x03) << 8) | buffer[2];
         if (expectedLength == 0 || expectedLength > 480) {
-          Serial.println("[RTCM] Invalid or zero length");
+          Serial.println("[RTCM] Invalid length");
           inPacket = false;
           index = 0;
           continue;
@@ -184,7 +198,7 @@ void loop() {
       }
 
       if (index >= sizeof(buffer)) {
-        Serial.println("[RTCM] Temp buffer overflow");
+        Serial.println("[RTCM] Buffer overflow");
         inPacket = false;
         index = 0;
       }
@@ -196,20 +210,44 @@ void loop() {
     rtcmBufferIndex = 0;
   }
 
+  // Rover 좌표 수신 처리
   if (surveyComplete && coordReceived) {
     coordReceived = false;
-    uint8_t locBuffer[64] = {0};
+
+    uint8_t locBuffer[64] = { 0 };
     int len = radio.readData(locBuffer, sizeof(locBuffer));
+
     if (len == RADIOLIB_ERR_NONE) {
-      String msg = (char*)locBuffer;
-      if (msg.indexOf(',') > 0) {
-        float lat = msg.substring(0, msg.indexOf(',')).toFloat();
-        float lon = msg.substring(msg.indexOf(',') + 1).toFloat();
-        Serial.printf("[Rover 좌표 수신] %.8f, %.8f\n", lat, lon);
+      int actualLen = radio.getPacketLength();
+      locBuffer[actualLen] = '\0';  // 문자열 끝 처리 반드시 필요
+      String msg = String((char*)locBuffer);
+      Serial.println("[RAW] " + msg);
+
+      int t1 = msg.indexOf(',');
+      int t2 = msg.indexOf(',', t1 + 1);
+      int t3 = msg.indexOf(',', t2 + 1);
+
+      if (t1 > 0 && t2 > t1 && t3 > t2) {
+        String timeStr = msg.substring(0, t1);
+        double lat = msg.substring(t1 + 1, t2).toDouble();
+        double lon = msg.substring(t2 + 1, t3).toDouble();
+        int fix = msg.substring(t3 + 1).toInt();
+
+        Serial.print("[Rover Time] ");
+        Serial.println(timeStr);
+        Serial.print("[Rover Lat] ");
+        Serial.println(lat, 8);
+        Serial.print("[Rover Lon] ");
+        Serial.println(lon, 8);
+        Serial.print("[Rover Fix] ");
+        Serial.println(fix);
+      } else {
+        Serial.println("[LoRa] ⚠️ 메시지 파싱 실패");
       }
     } else {
       Serial.printf("[LoRa] ❌ 좌표 수신 실패 (code %d)\n", len);
     }
+
     radio.startReceive();
   }
 }
