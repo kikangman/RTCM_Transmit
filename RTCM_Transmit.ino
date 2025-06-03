@@ -1,13 +1,12 @@
-
 //git kikangman
 /*
 cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
 ./save_push.sh "??"
-
 */
 
 #include <HardwareSerial.h>
 #include <RadioLib.h>
+#include "RTCM1005Parser.h"
 
 #define RX_GNSS 9
 #define TX_GNSS 8
@@ -19,6 +18,8 @@ cd /Users/kikang/Desktop/ki/summershot/RTK/RTCM_Transmit
 #define CUSTOM_DIO1 2
 #define CUSTOM_NRST 4
 #define CUSTOM_BUSY 3
+
+RTCM1005Parser parser
 
 HardwareSerial GNSS(2);
 SPIClass customSPI(HSPI);
@@ -45,6 +46,7 @@ unsigned long lastByteTime = 0;
 const unsigned long GAP_TIMEOUT_MS = 200;
 
 bool surveyComplete = false;
+bool suppressSVIN = false;
 String gnssLine = "";
 
 void sendCommandWithChecksum(const String& cmdBody) {
@@ -88,7 +90,7 @@ void transmitRtcmChunked(uint8_t* data, size_t length) {
         ;
       transmittedFlag = false;
       radio.finishTransmit();
-      Serial.printf("[LoRa] ✅ Chunk %d/%d sent\n", seq + 1, totalChunks);
+      //Serial.printf("[LoRa] ✅ Chunk %d/%d sent\n", seq + 1, totalChunks);
     } else {
       Serial.printf("[LoRa] ❌ Chunk %d send failed: %d\n", seq, state);
       break;
@@ -98,7 +100,7 @@ void transmitRtcmChunked(uint8_t* data, size_t length) {
 
   radio.startReceive();
   radio.setPacketReceivedAction(setCoordReceivedFlag);
-  Serial.println("[Base] 수신 대기 시작");
+  //Serial.println("[Base] 수신 대기 시작");
 }
 
 void setup() {
@@ -126,11 +128,11 @@ void setup() {
 
   sendCommandWithChecksum("PAIR432,-1");
   delay(300);
-  sendCommandWithChecksum("PAIR434,0");
+  sendCommandWithChecksum("PAIR434,1");
   delay(300);
   sendCommandWithChecksum("PQTMCFGRCVRMODE,W,2");
   delay(300);
-  sendCommandWithChecksum("PQTMCFGSVIN,W,1,300,2.0,0,0,0");
+  sendCommandWithChecksum("PQTMCFGSVIN,W,1,100,2.0,0,0,0");
   delay(300);
   sendCommandWithChecksum("PQTMCFGMSGRATE,W,PQTMSVINSTATUS,2,1");
   delay(300);
@@ -149,6 +151,7 @@ void loop() {
   // RTCM 수신 처리
   while (GNSS.available()) {
     uint8_t c = GNSS.read();
+
     lastByteTime = now;
 
     if (!inPacket) {
@@ -158,6 +161,10 @@ void loop() {
         inPacket = true;
       } else {
         if (c == '\n') {
+          if (gnssLine.startsWith("$PQTMSVINSTATUS") && !suppressSVIN) {
+            Serial.println("[SVIN 수신] " + gnssLine);
+          }
+
           if (!surveyComplete && gnssLine.startsWith("$PQTMSVINSTATUS") && gnssLine.indexOf(",2,") > 0) {
             surveyComplete = true;
             Serial.println("✅ Survey-In 완료!");
@@ -188,6 +195,31 @@ void loop() {
       }
 
       if (index == expectedLength + 6) {
+        // 메시지 ID 추출
+        if (index >= 6) {
+          uint16_t msgID = ((buffer[3] << 4) | (buffer[4] >> 4)) & 0x0FFF;
+
+          if (msgID == 1005) {
+            Serial.print("[RTCM]: ");
+            for (size_t i = 0; i < index; i++) {
+              if (buffer[i] < 0x10) Serial.print('0');
+              Serial.print(buffer[i], HEX);
+              Serial.print(' ');
+            }
+            Serial.println();
+            if (parser.parseMessage(buffer, index)) {
+              Serial.print("[Parsed Lat] ");
+              Serial.println(parser.getLatitude(), 8);
+              Serial.print("[Parsed Lon] ");
+              Serial.println(parser.getLongitude(), 8);
+              Serial.print("[Parsed Alt] ");
+              Serial.println(parser.getAltitude(), 3);
+            } else {
+              Serial.println("[RTCM] ❌ 파싱 실패");
+            }
+          }
+        }
+
         if (surveyComplete && rtcmBufferIndex + index < sizeof(rtcmBuffer)) {
           memcpy(rtcmBuffer + rtcmBufferIndex, buffer, index);
           rtcmBufferIndex += index;
@@ -206,6 +238,7 @@ void loop() {
   }
 
   if (surveyComplete && rtcmBufferIndex > 0 && now - lastByteTime > GAP_TIMEOUT_MS) {
+    suppressSVIN = true;  // SVIN 메시지 출력 중지
     transmitRtcmChunked(rtcmBuffer, rtcmBufferIndex);
     rtcmBufferIndex = 0;
   }
@@ -219,7 +252,7 @@ void loop() {
 
     if (len == RADIOLIB_ERR_NONE) {
       int actualLen = radio.getPacketLength();
-      locBuffer[actualLen] = '\0';  // 문자열 끝 처리 반드시 필요
+      locBuffer[actualLen] = '\0';
       String msg = String((char*)locBuffer);
       Serial.println("[RAW] " + msg);
 
@@ -233,8 +266,8 @@ void loop() {
         double lon = msg.substring(t2 + 1, t3).toDouble();
         int fix = msg.substring(t3 + 1).toInt();
 
-        Serial.print("[Rover Time] ");
-        Serial.println(timeStr);
+        // Serial.print("[Rover Time] ");
+        // Serial.println(timeStr);
         Serial.print("[Rover Lat] ");
         Serial.println(lat, 8);
         Serial.print("[Rover Lon] ");
